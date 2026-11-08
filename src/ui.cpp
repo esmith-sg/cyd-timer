@@ -30,6 +30,16 @@ static lv_color_t accent() { return lv_color_hex(ACCENTS[settings.accent % 4]); 
 #define IDX(e) ((int)(intptr_t)lv_event_get_user_data(e))
 #define UD(i) ((void *)(intptr_t)(i))
 
+// LVGL redraws a label on every set_text, even with identical text. Skip no-op updates.
+static bool setText(lv_obj_t *l, const char *t) {
+  if (!strcmp(lv_label_get_text(l), t)) return false;
+  lv_label_set_text(l, t);
+  return true;
+}
+static void setTextColor(lv_obj_t *o, lv_color_t c) {
+  if (lv_obj_get_style_text_color(o, 0).full != c.full) lv_obj_set_style_text_color(o, c, 0);
+}
+
 // ---------------- theme ----------------
 
 static lv_style_t stScr, stCard, stTransp, stBtn, stBtnPr, stItems, stItemsPr, stItemsChk, stField, stFieldFocus,
@@ -256,7 +266,7 @@ static void delParentReady(lv_anim_t *a) { lv_obj_del_async(lv_obj_get_parent((l
 
 static lv_obj_t *mkLabel(lv_obj_t *p, const char *txt, const lv_font_t *font = nullptr, lv_color_t *color = nullptr) {
   lv_obj_t *l = lv_label_create(p);
-  lv_label_set_text(l, txt);
+  setText(l, txt);
   if (font) lv_obj_set_style_text_font(l, font, 0);
   if (color) lv_obj_set_style_text_color(l, *color, 0);
   return l;
@@ -270,7 +280,7 @@ static lv_obj_t *mkBtn(lv_obj_t *p, const char *txt, lv_event_cb_t cb, void *ud,
   lv_obj_set_size(b, w, h);
   if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
   lv_obj_t *l = lv_label_create(b);
-  lv_label_set_text(l, txt);
+  setText(l, txt);
   lv_obj_center(l);
   return b;
 }
@@ -366,7 +376,7 @@ static void modalClose(lv_obj_t *panel) { // slide the panel away, then delete t
 
 static void toast(const char *msg) {
   lv_obj_t *t = lv_label_create(lv_layer_top());
-  lv_label_set_text(t, msg);
+  setText(t, msg);
   lv_obj_set_style_bg_color(t, C_SURF2, 0);
   lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
   lv_obj_set_style_text_color(t, C_TEXT, 0);
@@ -395,7 +405,7 @@ static void dayWord(time_t ts, char *buf, size_t n) {
 
 static void splitClock(const struct tm &tm, char *hm, size_t n, const char **ampm) {
 #if USE_12H
-  snprintf(hm, n, "%d:%02d", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min);
+  snprintf(hm, n, "%2d:%02d", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min);
   *ampm = tm.tm_hour < 12 ? "AM" : "PM";
 #else
   snprintf(hm, n, "%02d:%02d", tm.tm_hour, tm.tm_min);
@@ -416,9 +426,48 @@ static int sortedTimers(int *order) {
   return n;
 }
 
+// ---------------- Per-digit clock ----------------
+// Each character is its own label, so when the time changes only the digits that
+// actually changed get redrawn and animated (21:45 -> 21:46 only touches the last one).
+
+struct DigitRow {
+  lv_obj_t *box;
+  lv_obj_t *c[5];
+  uint8_t n;
+};
+
+// pattern: "00:00" or "00" - digit slots get a fixed width so nothing shifts sideways
+static void mkDigitRow(DigitRow &r, lv_obj_t *parent, const lv_font_t *font, const char *pattern) {
+  r.box = mkBox(parent, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_text_font(r.box, font, 0); // inherited by the digit labels
+  lv_coord_t w = lv_font_get_glyph_width(font, '0', '0');
+  r.n = strlen(pattern);
+  for (int i = 0; i < r.n; i++) {
+    r.c[i] = lv_label_create(r.box);
+    lv_label_set_text(r.c[i], pattern[i] == ':' ? ":" : "");
+    if (pattern[i] != ':') {
+      lv_obj_set_width(r.c[i], w);
+      lv_obj_set_style_text_align(r.c[i], LV_TEXT_ALIGN_CENTER, 0);
+    }
+  }
+}
+
+static void setDigits(DigitRow &r, const char *s, int dy, uint32_t ms) {
+  bool ended = false;
+  for (int i = 0; i < r.n; i++) {
+    if (!s[i]) ended = true;
+    char ch[2] = {ended ? ' ' : s[i], 0};
+    if (setText(r.c[i], ch) && ms) {
+      anim(r.c[i], exTY, dy, 0, ms);
+      anim(r.c[i], exTextOpa, 0, LV_OPA_COVER, ms);
+    }
+  }
+}
+
 // ---------------- Clock tab ----------------
 
-static lv_obj_t *lblHM, *lblSec, *lblAmPm, *lblDate, *lblNextWhen, *lblNextText, *clkTimerCard, *clkRing, *clkRingLbl,
+static DigitRow clkHM;
+static lv_obj_t *lblAmPm, *lblDate, *lblNextWhen, *lblNextText, *clkTimerCard, *clkRing, *clkRingLbl,
     *clkTimerName;
 static int8_t clkBand = -1;
 
@@ -432,12 +481,14 @@ static void buildClock(lv_obj_t *tab) {
   lv_obj_t *row = mkBox(tab, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
   lv_obj_set_style_pad_column(row, 12, 0);
-  lblHM = mkLabel(row, "--:--", &font_clock_150);
+  mkDigitRow(clkHM, row, &font_clock_150, "00:00");
   lv_obj_t *col = mkBox(row, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_bottom(col, 4, 0);
+  lv_obj_set_style_pad_bottom(col, 10, 0);
   lblAmPm = mkLabelC(col, "", &font_raj_34, C_DIM);
-  lblSec = mkLabel(col, "", &font_raj_48);
-  lv_obj_add_style(lblSec, &stAccentText, 0);
+#if !USE_12H
+  lv_obj_add_flag(col, LV_OBJ_FLAG_HIDDEN); // keep the 24h clock centred
+#endif
 
   lblDate = mkLabelC(tab, "", &font_raj_34, C_DIM);
 
@@ -474,13 +525,6 @@ static void buildClock(lv_obj_t *tab) {
   lv_obj_add_flag(clkTimerCard, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void setTextAnimated(lv_obj_t *l, const char *txt, int dy, uint32_t ms) {
-  if (!strcmp(lv_label_get_text(l), txt)) return;
-  lv_label_set_text(l, txt);
-  anim(l, exTY, dy, 0, ms);
-  anim(l, exTextOpa, 0, LV_OPA_COVER, ms);
-}
-
 static void updateClock() {
   char buf[96];
   if (timeValid()) {
@@ -489,12 +533,10 @@ static void updateClock() {
     localtime_r(&now, &tm);
     const char *ampm;
     splitClock(tm, buf, sizeof(buf), &ampm);
-    setTextAnimated(lblHM, buf, -16, 420);
-    lv_label_set_text(lblAmPm, ampm);
-    snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
-    setTextAnimated(lblSec, buf, -10, 220);
+    setDigits(clkHM, buf, -16, 420);
+    setText(lblAmPm, ampm);
     strftime(buf, sizeof(buf), "%A, %B %e", &tm);
-    lv_label_set_text(lblDate, buf);
+    setText(lblDate, buf);
 
     time_t when;
     int i = nextReminder(&when);
@@ -505,19 +547,18 @@ static void updateClock() {
       formatClock(clk, sizeof(clk), wt.tm_hour, wt.tm_min);
       dayWord(when, day, sizeof(day));
       snprintf(buf, sizeof(buf), "%s  %s", day, clk);
-      lv_label_set_text(lblNextWhen, buf);
-      lv_label_set_text(lblNextText, reminders[i].text);
+      setText(lblNextWhen, buf);
+      setText(lblNextText, reminders[i].text);
     } else {
-      lv_label_set_text(lblNextWhen, "No reminders");
-      lv_label_set_text(lblNextText, "Add one in the Remind tab");
+      setText(lblNextWhen, "No reminders");
+      setText(lblNextText, "Add one in the Remind tab");
     }
   } else {
-    lv_label_set_text(lblHM, "--:--");
-    lv_label_set_text(lblSec, "");
-    lv_label_set_text(lblAmPm, "");
-    lv_label_set_text(lblDate, WiFi.status() == WL_CONNECTED ? "Getting the time..." : "Waiting for WiFi...");
-    lv_label_set_text(lblNextWhen, "Reminders paused");
-    lv_label_set_text(lblNextText, "They need WiFi to know the time");
+    setDigits(clkHM, "--:--", 0, 0);
+    setText(lblAmPm, "");
+    setText(lblDate, WiFi.status() == WL_CONNECTED ? "Getting the time..." : "Waiting for WiFi...");
+    setText(lblNextWhen, "Reminders paused");
+    setText(lblNextText, "They need WiFi to know the time");
   }
 }
 
@@ -537,10 +578,10 @@ static void updateClockTimer() {
   ringShow(clkRing, t, rem, &clkBand);
   char buf[40];
   formatDuration(buf, sizeof(buf), rem);
-  lv_label_set_text(clkRingLbl, buf);
+  setText(clkRingLbl, buf);
   if (n > 1) snprintf(buf, sizeof(buf), "+%d more", n - 1);
   else timerDisplayLabel(order[0], buf, sizeof(buf));
-  lv_label_set_text(clkTimerName, buf);
+  setText(clkTimerName, buf);
 }
 
 // ---------------- Timers tab ----------------
@@ -697,7 +738,7 @@ static void updateTimers() {
     formatDuration(buf, sizeof(buf), rem);
     if (strcmp(lv_label_get_text(tTime[i]), buf)) {
       lv_obj_set_style_text_font(tTime[i], strlen(buf) > 5 ? &font_raj_26 : &font_raj_34, 0);
-      lv_label_set_text(tTime[i], buf);
+      setText(tTime[i], buf);
       lv_obj_align_to(tTime[i], tRing[i], LV_ALIGN_CENTER, 0, -6);
     }
   }
@@ -953,7 +994,7 @@ static void swatchRefresh() {
     bool sel = i == settings.accent;
     lv_obj_set_style_border_width(swatch[i], sel ? 4 : 0, 0);
     lv_obj_t *l = lv_obj_get_child(swatch[i], 0);
-    lv_label_set_text(l, sel ? LV_SYMBOL_OK : "");
+    setText(l, sel ? LV_SYMBOL_OK : "");
   }
 }
 static void swatchCb(lv_event_t *e) {
@@ -1057,9 +1098,9 @@ static void updateNet() {
     snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  WiFi not connected (trying \"%s\")\nTimers still work without WiFi.",
              WIFI_SSID);
   }
-  lv_label_set_text(lblNet, buf);
-  lv_obj_set_style_text_color(lblStatusIcon, up ? C_DIM : C_ORANGE, 0);
-  lv_label_set_text(lblStatusIcon, up ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
+  setText(lblNet, buf);
+  setTextColor(lblStatusIcon, up ? C_DIM : C_ORANGE);
+  setText(lblStatusIcon, up ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
 }
 
 // ---------------- Backlight fades & ambient mode ----------------
@@ -1071,7 +1112,8 @@ static void fadeBacklight(int to, uint32_t ms, lv_anim_ready_cb_t ready = nullpt
   anim(&blVar, exBacklight, curBl < 0 ? settings.brightness : curBl, to, ms, lv_anim_path_ease_in_out, 0, ready);
 }
 
-static lv_obj_t *amb, *ambHM, *ambAmPm, *ambDate, *ambNext, *ambTimer;
+static DigitRow ambHM;
+static lv_obj_t *amb, *ambAmPm, *ambDate, *ambNext, *ambTimer;
 static bool ambOn = false;
 
 static bool isNight() {
@@ -1091,17 +1133,17 @@ static void updateAmbient() {
   char buf[96];
   bool night = settings.nightDim && isNight();
   lv_color_t c = night ? C_ORANGE : C_TEXT;
-  lv_obj_set_style_text_color(ambHM, c, 0);
+  setTextColor(ambHM.box, c);
   if (timeValid()) {
     time_t now = time(nullptr);
     struct tm tm;
     localtime_r(&now, &tm);
     const char *ampm;
     splitClock(tm, buf, sizeof(buf), &ampm);
-    setTextAnimated(ambHM, buf, -16, 600);
-    lv_label_set_text(ambAmPm, ampm);
+    setDigits(ambHM, buf, -16, 600);
+    setText(ambAmPm, ampm);
     strftime(buf, sizeof(buf), "%A, %B %e", &tm);
-    lv_label_set_text(ambDate, buf);
+    setText(ambDate, buf);
     time_t when;
     int i = nextReminder(&when);
     if (i >= 0) {
@@ -1111,15 +1153,15 @@ static void updateAmbient() {
       formatClock(clk, sizeof(clk), wt.tm_hour, wt.tm_min);
       dayWord(when, day, sizeof(day));
       snprintf(buf, sizeof(buf), LV_SYMBOL_BELL "  %s %s  -  %s", day, clk, reminders[i].text);
-      lv_label_set_text(ambNext, buf);
+      setText(ambNext, buf);
     } else {
-      lv_label_set_text(ambNext, "");
+      setText(ambNext, "");
     }
   } else {
-    lv_label_set_text(ambHM, "--:--");
-    lv_label_set_text(ambAmPm, "");
-    lv_label_set_text(ambDate, "");
-    lv_label_set_text(ambNext, "");
+    setDigits(ambHM, "--:--", 0, 0);
+    setText(ambAmPm, "");
+    setText(ambDate, "");
+    setText(ambNext, "");
   }
   int order[MAX_TIMERS];
   int n = sortedTimers(order);
@@ -1128,9 +1170,9 @@ static void updateAmbient() {
     formatDuration(rem, sizeof(rem), timerRemainingMs(timers[order[0]]));
     timerDisplayLabel(order[0], lbl, sizeof(lbl));
     snprintf(buf, sizeof(buf), LV_SYMBOL_LOOP "  %s  %s%s", rem, lbl, n > 1 ? "  (+more)" : "");
-    lv_label_set_text(ambTimer, buf);
+    setText(ambTimer, buf);
   } else {
-    lv_label_set_text(ambTimer, "");
+    setText(ambTimer, "");
   }
 }
 
@@ -1168,7 +1210,7 @@ static void buildAmbient() {
   lv_obj_t *row = mkBox(amb, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
   lv_obj_set_style_pad_column(row, 10, 0);
-  ambHM = mkLabel(row, "", &font_clock_150);
+  mkDigitRow(ambHM, row, &font_clock_150, "00:00");
   ambAmPm = mkLabel(row, "", &font_raj_34);
   lv_obj_set_style_pad_bottom(ambAmPm, 6, 0);
   ambDate = mkLabel(amb, "", &font_raj_34);
@@ -1246,10 +1288,10 @@ static void showAlert() {
   lv_obj_set_style_border_color(alertCard, c, 0);
   lv_obj_set_style_text_color(alertTitle, c, 0);
   lv_obj_set_style_text_color(alertBell, c, 0);
-  lv_label_set_text(alertTitle, isTimer ? "TIME'S UP" : isReminder ? "REMINDER" : a.title);
-  lv_label_set_text(alertText, a.text);
+  setText(alertTitle, isTimer ? "TIME'S UP" : isReminder ? "REMINDER" : a.title);
+  setText(alertText, a.text);
   if (alertCount > 1) lv_label_set_text_fmt(alertMore, "+%d waiting", alertCount - 1);
-  else lv_label_set_text(alertMore, "");
+  else setText(alertMore, "");
   if (a.snoozeMin) {
     lv_label_set_text_fmt(alertSnoozeLbl, isReminder ? "Snooze %d min" : "+%d min", a.snoozeMin);
     lv_obj_clear_flag(alertSnooze, LV_OBJ_FLAG_HIDDEN);
